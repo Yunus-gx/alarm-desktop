@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef } from 'react'
 import { Player } from 'lottie-react'
 import AlarmForm from './components/AlarmForm'
 import AlarmItem from './components/AlarmItem'
-import lottieData from '../public/hero-lottie.json'
+import lottieData from './assets/hero-lottie.json'
 
 const STORAGE_KEY = 'alarm-desktop:alarms'
 

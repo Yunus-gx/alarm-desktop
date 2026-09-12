@@ -1,22 +1,90 @@
 import React, { useEffect, useState, useRef } from 'react'
-import { Player } from 'lottie-react'
 import AlarmForm from './components/AlarmForm'
 import AlarmItem from './components/AlarmItem'
 import lottieData from './assets/hero-lottie.json'
 
 const STORAGE_KEY = 'alarm-desktop:alarms'
+const VALID_REPEAT_OPTIONS = new Set(['once', 'daily', 'weekdays'])
+
+function pad2(value){
+  return String(value).padStart(2, '0')
+}
+
+function toTimeKey(date){
+  return `${pad2(date.getHours())}:${pad2(date.getMinutes())}`
+}
+
+function normalizeTime(time){
+  if(typeof time !== 'string') return null
+  const [rawHour, rawMinute] = time.split(':')
+  const hour = Number(rawHour)
+  const minute = Number(rawMinute)
+  if(!Number.isInteger(hour) || !Number.isInteger(minute)) return null
+  if(hour < 0 || hour > 23 || minute < 0 || minute > 59) return null
+  return `${pad2(hour)}:${pad2(minute)}`
+}
+
+function normalizeAlarm(alarm){
+  if(!alarm || typeof alarm !== 'object') return null
+  const time = normalizeTime(alarm.time)
+  if(!time) return null
+  const repeat = VALID_REPEAT_OPTIONS.has(alarm.repeat) ? alarm.repeat : 'daily'
+  const idValue = alarm.id ?? Date.now().toString()
+  const id = typeof idValue === 'string' ? idValue : String(idValue)
+  return {
+    id,
+    time,
+    label: typeof alarm.label === 'string' ? alarm.label : 'Alarm',
+    repeat,
+    enabled: alarm.enabled !== false,
+    fired: Boolean(alarm.fired),
+    _firedOn: Array.isArray(alarm._firedOn) ? alarm._firedOn.filter(x=>typeof x === 'string') : [],
+  }
+}
 
 export default function App(){
   const [alarms, setAlarms] = useState([])
   const audioRef = useRef(null)
+  const [LottieComponent, setLottieComponent] = useState(null)
+  const [lottieFailed, setLottieFailed] = useState(false)
 
   useEffect(()=>{
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if(raw) setAlarms(JSON.parse(raw))
+    let active = true
+    import('lottie-react')
+      .then(mod=>{
+        if(!active) return
+        if(mod?.default){
+          setLottieComponent(()=>mod.default)
+        } else {
+          setLottieFailed(true)
+        }
+      })
+      .catch(()=>{
+        if(active) setLottieFailed(true)
+      })
+    return ()=>{ active = false }
   },[])
 
   useEffect(()=>{
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(alarms))
+    if(typeof window === 'undefined') return
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY)
+      if(!raw) return
+      const parsed = JSON.parse(raw)
+      if(!Array.isArray(parsed)) return
+      setAlarms(parsed.map(normalizeAlarm).filter(Boolean))
+    } catch (error) {
+      console.error('Failed to load alarms from localStorage', error)
+    }
+  },[])
+
+  useEffect(()=>{
+    if(typeof window === 'undefined') return
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(alarms))
+    } catch (error) {
+      console.error('Failed to persist alarms', error)
+    }
   },[alarms])
 
   useEffect(()=>{
@@ -26,56 +94,90 @@ export default function App(){
 
   function checkAlarms(){
     const now = new Date()
-    const nowKey = `${now.getHours()}:${now.getMinutes()}`
+    const nowKey = toTimeKey(now)
+    const today = todayKey(now)
     alarms.forEach(alarm=>{
+      if(!alarm || typeof alarm !== 'object') return
       if(!alarm.enabled) return
       if(alarm.fired) return
+      const alarmTime = normalizeTime(alarm.time)
+      if(!alarmTime || alarmTime !== nowKey) return
+      const firedOn = Array.isArray(alarm._firedOn) ? alarm._firedOn : []
 
       if(alarm.repeat === 'once'){
-        if(alarm.time === nowKey && !alarm._firedOn?.includes(todayKey())){
+        if(!firedOn.includes(today)){
           triggerAlarm(alarm.id)
         }
       } else {
-        if(alarm.time === nowKey){
-          // basic repeat: daily or weekdays
-          if(alarm.repeat === 'daily') triggerAlarm(alarm.id)
-          if(alarm.repeat === 'weekdays'){
-            const d = now.getDay()
-            if(d >= 1 && d <=5) triggerAlarm(alarm.id)
-          }
+        if(alarm.repeat === 'daily') triggerAlarm(alarm.id)
+        if(alarm.repeat === 'weekdays'){
+          const d = now.getDay()
+          if(d >= 1 && d <=5) triggerAlarm(alarm.id)
         }
       }
     })
   }
 
-  function todayKey(){
-    const d = new Date()
+  function todayKey(d = new Date()){
     return d.toDateString()
   }
 
   function triggerAlarm(id){
-    setAlarms(prev=>prev.map(a=> a.id===id ? {...a, fired:true, _firedOn:[...(a._firedOn||[]), todayKey()]} : a))
+    const today = todayKey()
+    setAlarms(prev=>prev.map(a=>{
+      if(!a || a.id !== id) return a
+      const firedOn = Array.isArray(a._firedOn) ? a._firedOn : []
+      const nextFiredOn = firedOn.includes(today) ? firedOn : [...firedOn, today]
+      return { ...a, fired: true, _firedOn: nextFiredOn }
+    }))
     // play sound
-    if(audioRef.current) audioRef.current.play().catch(()=>{})
+    if(audioRef.current){
+      try {
+        const playResult = audioRef.current.play()
+        if(playResult?.catch) playResult.catch(()=>{})
+      } catch (error) {
+        console.error('Failed to play alarm audio', error)
+      }
+    }
     // browser notification
-    if('Notification' in window){
-      if(Notification.permission === 'granted'){
-        new Notification('Alarm', { body: alarms.find(a=>a.id===id)?.label || 'Alarm' })
-      } else if(Notification.permission !== 'denied'){
-        Notification.requestPermission().then(p=>{
-          if(p === 'granted') new Notification('Alarm', { body: alarms.find(a=>a.id===id)?.label || 'Alarm' })
-        })
+    if(typeof window !== 'undefined' && 'Notification' in window){
+      const label = alarms.find(a=>a.id===id)?.label || 'Alarm'
+      try {
+        if(Notification.permission === 'granted'){
+          new Notification('Alarm', { body: label })
+        } else if(Notification.permission !== 'denied'){
+          Notification.requestPermission()
+            .then(p=>{
+              if(p === 'granted') new Notification('Alarm', { body: label })
+            })
+            .catch(()=>{})
+        }
+      } catch (error) {
+        console.error('Failed to show notification', error)
       }
     }
   }
 
   function addAlarm(obj){
     const id = Date.now().toString()
-    setAlarms(a=>[...a, { id, enabled:true, fired:false, _firedOn:[], ...obj }])
+    const time = normalizeTime(obj?.time) || toTimeKey(new Date())
+    const repeat = VALID_REPEAT_OPTIONS.has(obj?.repeat) ? obj.repeat : 'daily'
+    const label = typeof obj?.label === 'string' ? obj.label : ''
+    setAlarms(a=>[...a, { id, enabled:true, fired:false, _firedOn:[], time, label, repeat }])
   }
 
   function updateAlarm(id, changes){
-    setAlarms(a=>a.map(x=> x.id===id ? {...x, ...changes} : x))
+    setAlarms(a=>a.map(x=>{
+      if(!x || x.id !== id) return x
+      const next = { ...x, ...changes }
+      if('time' in changes){
+        next.time = normalizeTime(changes.time) || x.time
+      }
+      if('repeat' in changes){
+        next.repeat = VALID_REPEAT_OPTIONS.has(changes.repeat) ? changes.repeat : x.repeat
+      }
+      return next
+    }))
   }
 
   function removeAlarm(id){
@@ -87,7 +189,7 @@ export default function App(){
     if(!alarm) return
     const next = new Date()
     next.setMinutes(next.getMinutes()+minutes)
-    const time = `${next.getHours()}:${next.getMinutes()}`
+    const time = toTimeKey(next)
     updateAlarm(id, { time, fired:false })
   }
 
@@ -96,7 +198,13 @@ export default function App(){
       <div className="max-w-4xl mx-auto bg-white/5 rounded-2xl p-6 backdrop-blur-md shadow-lg">
         <div className="flex gap-6 items-center">
           <div className="w-48 h-48">
-            <Player autoplay loop src={lottieData} />
+            {LottieComponent && !lottieFailed ? (
+              <LottieComponent animationData={lottieData} autoplay loop />
+            ) : (
+              <div className="w-full h-full rounded-xl bg-slate-800/60 border border-white/10 flex items-center justify-center text-slate-300 text-sm">
+                Alarm Desktop
+              </div>
+            )}
           </div>
           <div className="flex-1">
             <h1 className="text-3xl font-bold">Alarm Desktop</h1>
